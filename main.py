@@ -1,0 +1,259 @@
+"""The main tabbyAPI module. Contains the FastAPI server and endpoints."""
+
+# Set this env var for cuda malloc async before torch is initalized
+import os
+
+import argparse
+import asyncio
+import pathlib
+import platform
+import signal
+from loguru import logger
+from typing import Optional
+
+from common import gen_logging, sampling
+from common.args import convert_args_to_dict, init_argparser
+from common.auth import load_auth_keys
+from common.actions import run_subcommand
+from common.logger import set_console_timestamps, setup_logger, xlogger
+from common.networking import port_bind_error
+from common.optional_dependencies import dependencies
+from common.signals import signal_handler
+from common.status_display import status_display
+from common.tabby_config import config
+
+
+async def entrypoint_async():
+    from common import model
+    from endpoints.server import start_api
+
+    """Async entry function for program startup"""
+
+    host = config.network.host
+    port = config.network.port
+
+    # Say so up front if the installed PyTorch can't use a GPU, rather than
+    # leaving it to surface as an obscure failure on the first model load
+    if dependencies.torch:
+        from common.hardware import torch_gpu_problem
+
+        gpu_problem = torch_gpu_problem()
+        if gpu_problem:
+            logger.error(gpu_problem)
+
+    # Make sure the configured address can be bound before spending time on
+    # a model load. No silent fallback to another port: clients are configured
+    # for this one, so a server that quietly moves is worse than one that stops
+    bind_error = port_bind_error(host, port)
+    if bind_error:
+        logger.error(
+            f"Cannot listen on {host}:{port}: {bind_error}\n"
+            "Another program is using that address. Stop it, or set a different "
+            "port with `network.port` in config.yml or --port.\n"
+            "Exiting."
+        )
+
+        return
+
+    # Set sampler parameter overrides if provided. Do this before the model
+    # load so a bad preset name fails fast instead of after a long load
+    sampling_override_preset, inline_overrides = sampling.split_sampling_section(
+        {"override_preset": config.sampling.override_preset, **config.sampling.inline_overrides()},
+        "the sampling config",
+    )
+    if sampling_override_preset or inline_overrides:
+        try:
+            await sampling.set_global_overrides(sampling_override_preset, inline_overrides)
+        except FileNotFoundError as e:
+            logger.error(
+                f"{e}\n"
+                "Fix `override_preset` in the sampling section of your config "
+                "(available presets: "
+                + (", ".join(sampling.get_all_presets()) or "none")
+                + "). Exiting."
+            )
+            raise SystemExit(1) from None
+        except TypeError as e:
+            logger.error(f"{e}. Exiting.")
+            raise SystemExit(1) from None
+    else:
+        logger.warning(
+            "No sampler overrides are configured (sampling.override_preset or inline "
+            "overrides in the sampling section), so sampling parameters have no fallback "
+            "values. Requests that omit them run untruncated: temperature 1.0, top_k 0, "
+            "top_p 1.0, min_p 0. Set override_preset to safe_defaults unless this is "
+            "intentional."
+        )
+
+    # If an initial model name is specified, create a container
+    # and load the model
+    model_name = config.model.model_name
+    if model_name:
+        model_path = pathlib.Path(config.model.model_dir)
+        model_path = model_path / model_name
+
+        # TODO: remove model_dump()
+        await model.load_model(
+            model_path.resolve(),
+            **config.model.model_dump(exclude_none=True),
+            draft_model=config.draft_model.model_dump(exclude_none=True),
+        )
+
+        # Load loras after loading the model
+        if config.lora.loras:
+            lora_dir = pathlib.Path(config.lora.lora_dir)
+            # TODO: remove model_dump()
+            await model.container.load_loras(lora_dir.resolve(), **config.lora.model_dump())
+
+    # If an initial embedding model name is specified, create a separate container
+    # and load the model
+    embedding_model_name = config.embeddings.embedding_model_name
+    if embedding_model_name:
+        embedding_model_path = pathlib.Path(config.embeddings.embedding_model_dir)
+        embedding_model_path = embedding_model_path / embedding_model_name
+
+        try:
+            # TODO: remove model_dump()
+            await model.load_embedding_model(embedding_model_path, **config.embeddings.model_dump())
+        except ImportError as ex:
+            logger.error(ex.msg)
+
+    # Initialize auth keys
+    await load_auth_keys(config.network.disable_auth)
+
+    gen_logging.broadcast_status()
+
+    if config.logging.log_live_status:
+        status_display.start()
+
+    try:
+        await start_api(host, port)
+    finally:
+        await status_display.stop()
+
+    # Uvicorn has finished serving; unload any loaded models so pending
+    # jobs are cancelled and the generator is closed cleanly
+    if model.container:
+        await model.unload_model(skip_wait=True, shutdown=True)
+
+    if model.embeddings_container:
+        await model.unload_embedding_model()
+
+
+def entrypoint(
+    args: Optional[argparse.Namespace] = None,
+    parser: Optional[argparse.ArgumentParser] = None,
+):
+    setup_logger()
+
+    # Set up signal aborting
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    if platform.system() == "Windows":
+        from winloop import install
+    else:
+        from uvloop import install
+
+    # Set loop event policy
+    install()
+
+    # Parse and override config from args
+    if args is None:
+        parser = init_argparser()
+        args = parser.parse_args()
+
+    dict_args = convert_args_to_dict(args, parser)
+
+    # load config
+    config.load(dict_args)
+    set_console_timestamps(config.logging.log_timestamps)
+
+    # optionally enable seqlog logging
+    if config.developer.seqlog:
+        xlogger.setup(
+            seqlog_url=config.developer.seqlog_server_url,
+            api_key=config.developer.seqlog_api_key,
+        )
+
+    # A ROCm torch needs two things settled before it or Triton is imported
+    from common.hardware import installed_torch_is_rocm
+
+    rocm_torch = installed_torch_is_rocm()
+    if rocm_torch:
+        # AMD's Triton build ships both backends and refuses to pick one on a machine
+        # that also has the NVIDIA driver
+        os.environ.setdefault("TRITON_DEFAULT_BACKEND", "amd")
+
+    # We need to configure the allocator before importing Torch
+    if config.memory.cuda_malloc_async and rocm_torch:
+        xlogger.warning(
+            "memory.cuda_malloc_async is ignored on ROCm: the cudaMallocAsync "
+            "allocator backend is CUDA-only."
+        )
+    elif config.memory.cuda_malloc_async:
+        env_key1 = "PYTORCH_ALLOC_CONF"
+        env_key2 = "PYTORCH_CUDA_ALLOC_CONF"
+        new_alloc_config = "backend:cudaMallocAsync"
+        prev_alloc_config = os.environ.get(env_key1, os.environ.get(env_key2))
+        os.environ[env_key1] = new_alloc_config
+        os.environ[env_key2] = new_alloc_config
+        import sys
+
+        if "torch" in sys.modules and prev_alloc_config != new_alloc_config:
+            xlogger.warning(
+                "`torch` was imported before config could be loaded. Unable to configure "
+                "allocator backend, using existing env setting: "
+                + (prev_alloc_config or "(Torch default)")
+            )
+        else:
+            xlogger.info("Configured backend: cudaMallocAsync")
+
+    # branch to default paths if required
+    if run_subcommand(args):
+        return
+
+    # Check inference dependencies and give a descriptive error if they are missing
+    # Skip if launching unsafely
+    if config.developer.unsafe_launch:
+        logger.warning(
+            "UNSAFE: Skipping ExllamaV3 version check.\n"
+            "If you aren't a developer, please keep this off!"
+        )
+    elif not dependencies.inference:
+        install_message = (
+            f"ERROR: Inference dependencies for TabbyAPI are not installed.\n"
+            "Please update your environment by running an update script "
+            "(update_scripts/"
+            f"update_deps.{'bat' if platform.system() == 'Windows' else 'sh'})\n\n"
+            "Or you can manually run a requirements update "
+            "using the following command:\n\n"
+            "For CUDA 12.x:\n"
+            "pip install --upgrade .[cu12]\n\n"
+            "For CUDA 13.x:\n"
+            "pip install --upgrade .[cu13]\n\n"
+        )
+
+        raise SystemExit(install_message)
+
+    # Set the process priority
+    if config.developer.realtime_process_priority:
+        import psutil
+
+        current_process = psutil.Process(os.getpid())
+        if platform.system() == "Windows":
+            current_process.nice(psutil.REALTIME_PRIORITY_CLASS)
+        else:
+            current_process.nice(psutil.IOPRIO_CLASS_RT)
+
+        logger.warning(
+            "EXPERIMENTAL: Process priority set to Realtime. \n"
+            "If you're not running on administrator/sudo, the priority is set to high."
+        )
+
+    # Enter into the async event loop
+    asyncio.run(entrypoint_async())
+
+
+if __name__ == "__main__":
+    entrypoint()

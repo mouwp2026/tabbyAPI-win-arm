@@ -117,6 +117,63 @@ def _console_sink(message):
 
 # Uvicorn log handler
 # Uvicorn log portions inspired from https://github.com/encode/uvicorn/discussions/2027#discussioncomment-6432362
+
+# A client hanging up mid-stream is normal: the SSE task gets cancelled while a
+# chunk is in flight, the write lands on a transport winloop already closed, and
+# the resulting RuntimeError reaches uvicorn as "Exception in ASGI application"
+# with a multi-page traceback. Filter those records out before they are
+# formatted so a routine browser cancel does not look like a server crash.
+# winloop raises this once the transport is gone; the suffix varies between
+# "closed" and "closing" depending on how far the shutdown got, so match the
+# stable prefix.
+_DISCONNECT_MARKERS = ("Cannot call write() when UVStream is",)
+
+
+def _walk_exceptions(exc):
+    stack = [exc]
+    seen = set()
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        yield e
+        stack.extend(getattr(e, "exceptions", ()) or getattr(e, "sub_exceptions", ()))
+        stack.append(e.__cause__)
+        stack.append(e.__context__)
+
+
+class ClientDisconnectFilter(logging.Filter):
+    """Turns a client-disconnect traceback into a single readable log line.
+
+    The traceback itself is dropped (it is dozens of frames of anyio/sse
+    plumbing with no diagnostic value), but the event is still recorded so a
+    cancelled generation leaves a trace instead of vanishing silently.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if exc is None:
+            return True
+
+        for e in _walk_exceptions(exc):
+            if isinstance(e, ConnectionResetError):
+                break
+            if isinstance(e, RuntimeError) and any(
+                m in str(e) for m in _DISCONNECT_MARKERS
+            ):
+                break
+        else:
+            # Ordinary server error: keep uvicorn's full traceback
+            return True
+
+        logger.info(
+            "Client disconnected mid-stream: response aborted, generation cancelled "
+            "(ASGI traceback suppressed)"
+        )
+        return False
+
+
 class UvicornLoggingHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         logger.opt(exception=record.exc_info).log(record.levelname, self.format(record).rstrip())
@@ -132,12 +189,17 @@ UVICORN_LOG_CONFIG = {
         },
     },
     "root": {"handlers": ["uvicorn"], "propagate": False, "level": LOG_LEVEL},
+    "filters": {
+        "client_disconnect": {
+            "()": f"{ClientDisconnectFilter.__module__}.{ClientDisconnectFilter.__qualname__}",
+        },
+    },
     # Uvicorn's startup chatter duplicates what TabbyAPI already logs, so only
     # its warnings and errors get through. Access lines are gated separately by
     # the network.access_log option
     "loggers": {
         "uvicorn": {"level": "WARNING"},
-        "uvicorn.error": {"level": "WARNING"},
+        "uvicorn.error": {"level": "WARNING", "filters": ["client_disconnect"]},
         "uvicorn.access": {"level": LOG_LEVEL},
     },
 }
